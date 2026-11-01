@@ -1,4 +1,5 @@
 
+import argparse
 import logging
 import queue
 import shutil
@@ -22,6 +23,9 @@ SEPARATOR = "__"
 STABLE_CHECKS = 3
 CHECK_INTERVAL = 1
 MAX_WAIT = 120
+
+# Default: Never push automatically.
+AUTO_PUSH = False
 
 IGNORE_DIRS = {
     ".git",
@@ -61,7 +65,7 @@ pending_lock = threading.Lock()
 # ==========================================
 
 def log(message):
-    print(message)
+    print(message, flush=True)
     logging.info(message)
 
 
@@ -79,7 +83,7 @@ def git(repo, *args):
 
 
 def find_repository(path):
-    """Find the nearest Git repository."""
+    """Find the nearest independent Git repository."""
 
     result = git(path.parent, "rev-parse", "--show-toplevel")
 
@@ -88,9 +92,8 @@ def find_repository(path):
 
     root = Path(result.stdout.strip()).resolve()
 
-    # Never use ~/dev itself as a repository.
+    # Never use ~/dev as one giant repository.
     if root == DEV.resolve():
-        log("[SKIP] ~/dev is an umbrella repository.")
         return None
 
     try:
@@ -106,6 +109,7 @@ def find_repository(path):
 # ==========================================
 
 def ignored(path):
+
     try:
         relative = path.relative_to(DEV.resolve())
     except ValueError:
@@ -137,11 +141,10 @@ def parse_filename(path):
     if not message or not filename:
         return None
 
-    # Only allow a filename, never a path.
+    # Prevent directory traversal.
     if Path(filename).name != filename:
         return None
 
-    # Avoid recursively processing generated files.
     if SEPARATOR in filename:
         return None
 
@@ -156,10 +159,12 @@ def parse_filename(path):
 # ==========================================
 
 def wait_until_ready(path):
+
     previous = None
     stable = 0
 
     for _ in range(MAX_WAIT):
+
         try:
             stat = path.stat()
             current = (stat.st_size, stat.st_mtime_ns)
@@ -200,65 +205,70 @@ def process_file(source):
 
     message, filename = parsed
 
+    # Find the nearest project repository.
     repo = find_repository(source)
 
     if repo is None:
         log(f"[SKIP] No independent Git repository: {source}")
         return
 
-    # Require a GitHub remote before changing files.
-    remote = git(repo, "remote", "get-url", "origin")
-
-    if remote.returncode != 0:
-        log(f"[SKIP] No origin remote: {repo}")
-        return
-
     destination = source.parent / filename
 
-    append_mode = destination.exists()
-
-    if append_mode:
-        log(f"[APPEND] Existing file found: {destination}")
-    else:
-        log(f"[CREATE] New file: {destination}")
-
+    # Make sure destination is inside the repository.
     try:
-        destination.relative_to(repo)
+        relative = destination.relative_to(repo)
     except ValueError:
-        log("[ERROR] Destination is outside the Git repository")
+        log("[ERROR] Destination is outside the repository")
+        return
+
+    # Reject directory destinations.
+    if destination.exists() and not destination.is_file():
+        log(f"[ERROR] Destination is not a regular file: {destination}")
         return
 
     log("")
-    log("=" * 45)
+    log("=" * 50)
     log(f"[DETECTED] {source}")
     log(f"[REPOSITORY] {repo}")
-    log(f"[NEW NAME] {filename}")
+    log(f"[TARGET] {filename}")
     log(f"[COMMIT MESSAGE] {message}")
 
-    # Preserve original download.
+    # ======================================
+    # COPY / OVERWRITE
+    # ======================================
+
     try:
-        if append_mode:
-            with destination.open("ab") as existing:
-                existing.write(b"\n")
-                with source.open("rb") as downloaded:
-                    shutil.copyfileobj(downloaded, existing)
+        if destination.exists():
+            log(f"[OVERWRITE] Existing file: {destination}")
         else:
-            shutil.copy2(source, destination)
+            log(f"[CREATE] New file: {destination}")
+
+        # Original download remains untouched.
+        # Existing destination is completely replaced.
+        shutil.copy2(source, destination)
 
     except OSError as error:
-        log(f"[ERROR] File operation failed: {error}")
-    return
+        log(f"[ERROR] Copy failed: {error}")
+        return
 
-    relative = destination.relative_to(repo)
+    log("[SUCCESS] File copied")
 
-    # Stage only the generated copy.
+    # ======================================
+    # GIT ADD
+    # ======================================
+
     result = git(repo, "add", "--", str(relative))
 
     if result.returncode != 0:
         log(f"[ERROR] Git add failed: {result.stderr}")
         return
 
-    # Commit only this file.
+    log("[SUCCESS] Git add")
+
+    # ======================================
+    # GIT COMMIT
+    # ======================================
+
     result = git(
         repo,
         "commit",
@@ -270,12 +280,35 @@ def process_file(source):
     )
 
     if result.returncode != 0:
-        log(f"[ERROR] Git commit failed: {result.stderr}")
+        log(f"[COMMIT FAILED] {result.stdout}{result.stderr}")
         return
 
-    log("[SUCCESS] Commit created!")
+    log("[SUCCESS] Local commit created")
 
-    # Detect upstream branch.
+    # ======================================
+    # PUSH CONTROL
+    # ======================================
+
+    if not AUTO_PUSH:
+
+        log("[MANUAL PUSH] GitHub push disabled")
+        log(f"[PROJECT] {repo}")
+        log(f"[COMMAND] git -C \"{repo}\" push")
+        log(f"[ORIGINAL KEPT] {source}")
+        log("=" * 50)
+
+        return
+
+    # ======================================
+    # AUTOMATIC PUSH
+    # ======================================
+
+    remote = git(repo, "remote", "get-url", "origin")
+
+    if remote.returncode != 0:
+        log("[PUSH FAILED] No origin remote configured")
+        return
+
     upstream = git(
         repo,
         "rev-parse",
@@ -285,17 +318,29 @@ def process_file(source):
     )
 
     if upstream.returncode == 0:
-        push = git(repo, "push")
+        push_args = ["git", "push"]
     else:
-        push = git(repo, "push", "-u", "origin", "HEAD")
+        push_args = ["git", "push", "-u", "origin", "HEAD"]
 
-    if push.returncode == 0:
-        log("[SUCCESS] Pushed to GitHub!")
-    else:
-        log(f"[PUSH FAILED] {push.stderr}")
+    log("[PUSHING] Uploading to GitHub...")
+
+    try:
+        push = subprocess.run(
+            push_args,
+            cwd=repo,
+            text=True
+        )
+
+        if push.returncode == 0:
+            log("[SUCCESS] Pushed to GitHub!")
+        else:
+            log(f"[PUSH FAILED] Exit code: {push.returncode}")
+
+    except Exception as error:
+        log(f"[PUSH ERROR] {error}")
 
     log(f"[ORIGINAL KEPT] {source}")
-    log("=" * 45)
+    log("=" * 50)
 
 
 # ==========================================
@@ -305,6 +350,7 @@ def process_file(source):
 def worker():
 
     while True:
+
         path = file_queue.get()
 
         if path is None:
@@ -342,6 +388,7 @@ class AutoGitHandler(FileSystemEventHandler):
             return
 
         with pending_lock:
+
             if path in pending:
                 return
 
@@ -350,10 +397,12 @@ class AutoGitHandler(FileSystemEventHandler):
         file_queue.put(path)
 
     def on_created(self, event):
+
         if not event.is_directory:
             self.enqueue(event.src_path)
 
     def on_moved(self, event):
+
         if not event.is_directory:
             self.enqueue(event.dest_path)
 
@@ -364,6 +413,22 @@ class AutoGitHandler(FileSystemEventHandler):
 
 def main():
 
+    global AUTO_PUSH
+
+    parser = argparse.ArgumentParser(
+        description="Global automatic Git file manager"
+    )
+
+    parser.add_argument(
+        "--auto-push",
+        action="store_true",
+        help="Automatically push commits to GitHub"
+    )
+
+    args = parser.parse_args()
+
+    AUTO_PUSH = args.auto_push
+
     if not DEV.is_dir():
         print(f"[ERROR] Development folder not found: {DEV}")
         return
@@ -371,17 +436,23 @@ def main():
     print("=" * 50)
     print("              GLOBAL AUTO GIT")
     print("=" * 50)
+
     print(f"Monitoring : {DEV}")
     print("Scope      : Individual Git repositories")
     print("Recursive  : Enabled")
     print("Originals  : Preserved")
-    print("Actions    : Copy -> Add -> Commit -> Push")
+    print("Overwrite  : Enabled")
+    print("Git Add    : Automatic")
+    print("Git Commit : Automatic")
+    print(f"Git Push   : {'AUTOMATIC' if AUTO_PUSH else 'MANUAL'}")
+
     print("=" * 50)
 
     thread = threading.Thread(
         target=worker,
         daemon=True
     )
+
     thread.start()
 
     observer = Observer()
@@ -395,16 +466,19 @@ def main():
     observer.start()
 
     try:
+
         while True:
             time.sleep(1)
 
     except KeyboardInterrupt:
+
         print("\nStopping Global Auto Git...")
 
         observer.stop()
         observer.join()
 
         file_queue.join()
+
         file_queue.put(None)
         file_queue.join()
 
