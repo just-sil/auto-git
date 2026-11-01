@@ -1,14 +1,12 @@
 # Auto Git
 
-An automated Git workflow that watches your development directory and handles file naming, staging, committing, and pushing to GitHub.
+A Python-based file automation utility that monitors `~/dev` recursively and manages independent Git repositories.
 
-## How it works
+It detects specially named files, creates or replaces their intended destination files, stages and commits the result, and optionally pushes to GitHub.
 
-Auto Git monitors `~/dev` and all its subdirectories recursively.
+## Filename convention
 
-When a newly downloaded file follows the naming convention, it automatically processes it.
-
-### Filename convention
+Use:
 
 ```text
 commit-message__actual-filename.extension
@@ -17,57 +15,121 @@ commit-message__actual-filename.extension
 Example:
 
 ```text
-added new feature__feature.py
+Move utility poles off road__index.html
 ```
 
-Auto Git interprets this as:
-
-- **Commit message:** `added new feature`
-- **Final filename:** `feature.py`
+- Text before `__` becomes the Git commit message.
+- Text after `__` becomes the final filename.
+- Hyphens in the commit message are converted to spaces.
+- The separator is exactly two underscores.
 
 ## Workflow
 
-1. Detect a newly created or downloaded file.
-2. Wait until the download is complete.
-3. Extract the commit message and actual filename.
-4. Identify the nearest independent Git repository.
-5. Create a renamed copy while preserving the original download.
-6. Stage the resulting file.
-7. Commit using the extracted message.
-8. Push to the repository's GitHub remote.
+When a matching new file is created or moved into a monitored project:
 
-## Existing file handling
+1. Wait for the file to stop changing.
+2. Parse the commit message and target filename.
+3. Find the nearest independent Git repository containing the file.
+4. Copy the downloaded file to the target path beside the original.
+5. If the target already exists, **overwrite it completely**.
+6. Keep the original downloaded file unchanged.
+7. Run `git add` for the target file only.
+8. Create a local commit using the extracted commit message.
+9. Push only when automatic push mode is explicitly enabled.
 
-If the destination file already exists, Auto Git appends the downloaded file's contents to the existing file.
+## Push modes
 
-Example:
+### Manual push — default
 
-```text
-added section__index.html
+Start the watcher with:
+
+```bash
+python3 auto_git.py
 ```
 
-If `index.html` already exists, the new content is appended to it. The original downloaded file remains untouched.
+Files are copied, staged and committed locally. Auto Git does not push to GitHub.
 
-**Note:** Appending is currently a raw byte-level operation, not an HTML-aware merge. For HTML files, this can produce duplicate document structure such as multiple `<html>`, `<head>`, or `<body>` elements.
+Push manually from the relevant project repository:
 
-## Directory structure
+```bash
+cd ~/dev/your-project
+git push
+```
+
+### Automatic push — opt-in
+
+Start the watcher with:
+
+```bash
+python3 auto_git.py --auto-push
+```
+
+After each successful local commit, Auto Git attempts to push the repository's current branch to its configured `origin` remote.
+
+## Example
+
+Input file:
+
+```text
+~/dev/kerala-drive/Move utility poles off road__index.html
+```
+
+Result:
+
+```text
+~/dev/kerala-drive/
+├── .git/
+├── index.html
+└── Move utility poles off road__index.html
+```
+
+Git commit:
+
+```bash
+git add index.html
+git commit -m "Move utility poles off road"
+```
+
+The downloaded original remains in place. The existing `index.html`, if any, is replaced by the downloaded file's contents.
+
+## Directory monitoring
+
+Auto Git watches:
 
 ```text
 ~/dev/
-├── auto-git/
-│   ├── auto-git.py
-│   └── logs/
-├── kerala-drive/
-│   ├── .git/
-│   └── ...
-└── other-project/
-    ├── .git/
-    └── ...
 ```
 
-Each project maintains its own Git history and remote.
+It monitors subdirectories recursively. Each file is associated with the nearest independent Git repository.
+
+The `~/dev` directory itself is deliberately not accepted as a project repository. Projects without their own Git repository are skipped. Auto Git does not initialize repositories or create remotes.
+
+## Ignored directories
+
+The watcher skips paths containing:
+
+- `.git`
+- `.venv`
+- `venv`
+- `__pycache__`
+- `node_modules`
+- `.idea`
+- `.vscode`
+- `dist`
+- `build`
+
+## Ignored file extensions
+
+- `.tmp`
+- `.part`
+- `.crdownload`
+- `.download`
+
+Files without the `__` separator are ignored.
 
 ## Installation
+
+From the Auto Git project directory:
 
 ```bash
 python3 -m venv .venv
@@ -77,38 +139,51 @@ pip install watchdog
 
 ## Run
 
+Manual push mode:
+
 ```bash
-python3 auto-git.py
+python3 auto_git.py
+```
+
+Automatic push mode:
+
+```bash
+python3 auto_git.py --auto-push
+```
+
+Stop the watcher with `Ctrl+C`.
+
+## Logs
+
+Runtime activity is recorded in:
+
+```text
+logs/auto_git.log
 ```
 
 ## Requirements
 
 - Python 3
 - Git
-- Python Watchdog
-- Independent Git repositories
-- Configured GitHub `origin` remote
-- Working GitHub authentication (SSH recommended)
+- Python package `watchdog`
+- An independent Git repository for each project
+- An `origin` remote configured for projects that need pushing
+- GitHub authentication configured for manual or automatic pushes
 
-## Logs
+## Important behaviour and limitations
 
-Activity is recorded in:
-
-```text
-auto-git/logs/auto_git.log
-```
-
-## Safety and limitations
-
-- Original downloads are preserved.
-- Existing destination files are appended to rather than overwritten.
-- Files without the `__` separator are ignored.
-- Dependency and temporary directories are excluded.
-- Projects without independent Git repositories are skipped.
-- Push failures leave the local commit intact.
-- The current watcher handles new files and completed downloads, not edits to existing files.
-- A raw append is not suitable for every file type; binary files and structured formats may need a merge strategy specific to that format.
+- Original downloaded files are preserved.
+- Existing destination files are overwritten completely, not appended.
+- The destination is created beside the downloaded original.
+- Only the destination file is staged and included in the automatic commit.
+- Unrelated staged changes are not intentionally included in that commit.
+- Push is disabled by default.
+- Push failures do not undo the local commit.
+- The watcher handles newly created and moved files; it does not monitor edits to existing files.
+- Existing uncommitted content in an overwritten destination can be lost. Commit or back up important work first.
+- The current implementation uses a single worker, so files are processed sequentially.
+- A file copied into a destination with the same name as its source is not a useful input and should be avoided.
 
 ## Project goal
 
-Make file-based Git workflows automatic: download, name, commit, and push without manually repeating Git commands.
+Make file-based Git workflows convenient while keeping the original downloads and leaving control of GitHub publishing with the user by default.
